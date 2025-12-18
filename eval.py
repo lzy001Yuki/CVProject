@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from cond_encoder import ConditionEncoders
 
 from tactile_encoder import DiffusionTactileEncoder
 from dataloader.tag_dataset import TouchAndGoPairDataset
@@ -66,6 +67,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--balance", type=str, default="none", choices=["none","loss","sampler","both"], help="Handle class imbalance via weighted loss and/or weighted sampler")
     p.add_argument("--class_weights", type=str, default=None, help="Optional comma-separated class weights; overrides auto-computed weights")
+    
+    p.add_argument("--siglip_model", type=str, default="google/siglip-base-patch16-224", help="SigLIP vision backbone")
+    p.add_argument("--t5_model", type=str, default="t5-base", help="T5 text encoder (encoder-only)")
     # System
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -247,19 +251,27 @@ def load_encoder(args: argparse.Namespace, device: torch.device) -> Tuple[Diffus
         return model, embed_dim
 
 
-def extract_features(encoder: DiffusionTactileEncoder, batch: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def extract_features(encoder: DiffusionTactileEncoder, batch: Dict[str, torch.Tensor], cond_enc: ConditionEncoders, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     tactile = batch["tactile"].to(device, non_blocking=True)
     labels = batch["label"].to(device, non_blocking=True)
+    vision_pils = batch["vision"] 
+    vis_emb = cond_enc.encode_images(vision_pils)
+    cond_tokens = vis_emb.unsqueeze(1)
     # Use t=0 to minimize noise variance in probing
     t = torch.zeros((tactile.size(0),), device=device, dtype=torch.long)
     with torch.no_grad():
-        feats = encoder(tactile, t, condition_tokens=None, return_tokens=False)  # (B, E)
+        feats = encoder(tactile, t, condition_tokens=, return_tokens=False)  # (B, E)
     return feats, labels
 
 
 def main(args: argparse.Namespace):
     set_seed(args.seed)
     device = torch.device(args.device)
+    cond_enc = ConditionEncoders(
+        device=device,
+        siglip_model=args.siglip_model,
+        t5_model=args.t5_model
+    )
 
     n_classes = get_num_classes(args.label)
     train_loader, test_loader = build_dataloaders(args)
@@ -293,7 +305,7 @@ def main(args: argparse.Namespace):
 
         pbar = tqdm(train_loader, desc=f"Train ep{epoch}")
         for batch in pbar:
-            feats, labels = extract_features(encoder, batch, device)
+            feats, labels = extract_features(encoder, batch, cond_enc, device)
             logits = classifier(feats)
             loss = criterion(logits, labels)
 
@@ -321,7 +333,7 @@ def main(args: argparse.Namespace):
         per_class_total = torch.zeros(n_classes, dtype=torch.long)
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Eval"):
-                feats, labels = extract_features(encoder, batch, device)
+                feats, labels = extract_features(encoder, batch, cond_enc, device)
                 logits = classifier(feats)
                 pred = logits.argmax(dim=1)
                 correct += (pred == labels).sum().item()
